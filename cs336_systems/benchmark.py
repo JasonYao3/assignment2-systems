@@ -3,13 +3,14 @@ import torch
 import logging
 from cs336_basics.model import BasicsTransformerLM
 import timeit
+from contextlib import nullcontext
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def benchmark_forward(model, input_data, num_steps, num_warmup_steps):
+def benchmark_forward(model, input_data, num_steps, num_warmup_steps, use_mixed_precision=False):
     """
     Benchmarks the forward pass of the model.
 
@@ -19,10 +20,16 @@ def benchmark_forward(model, input_data, num_steps, num_warmup_steps):
         num_steps: The number of steps to measure.
         num_warmup_steps: The number of warmup steps.
     """
+    if use_mixed_precision:
+        ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    else:
+        ctx = nullcontext()
+
     # Warmup loop: run forward pass without tracking gradients or timing
     for _ in range(num_warmup_steps):
         with torch.no_grad():
-            output = model(input_data)
+            with ctx:
+                output = model(input_data)
         torch.mps.synchronize()
 
     # Measurement loop
@@ -31,7 +38,8 @@ def benchmark_forward(model, input_data, num_steps, num_warmup_steps):
         torch.mps.synchronize()
         start = timeit.default_timer()
         with torch.no_grad():
-            output = model(input_data)
+            with ctx:
+                output = model(input_data)
 
         end = timeit.default_timer()
         torch.mps.synchronize()
@@ -44,15 +52,21 @@ def benchmark_forward(model, input_data, num_steps, num_warmup_steps):
     print(f"  - Throughput: {1 / mean_time:.2f} steps/second\n")
 
 
-def benchmark_forward_backward(model, input_data, num_steps, num_warmup_steps):
+def benchmark_forward_backward(model, input_data, num_steps, num_warmup_steps, use_mixed_precision=False):
     """
     Benchmarks the forward and backward pass of the model.
     """
+    if use_mixed_precision:
+        ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    else:
+        ctx = nullcontext()
+
     # Warmup loop: calculate gradients without timing
     for _ in range(num_warmup_steps):
         torch.mps.synchronize()
         model.zero_grad()
-        output = model(input_data)
+        with ctx:
+            output = model(input_data)
         loss = output.sum()
         loss.backward()
         torch.mps.synchronize()
@@ -63,7 +77,8 @@ def benchmark_forward_backward(model, input_data, num_steps, num_warmup_steps):
         torch.mps.synchronize()
         start = timeit.default_timer()
         model.zero_grad()
-        output = model(input_data)
+        with ctx:
+            output = model(input_data)
         loss = output.sum()
         loss.backward()
         end = timeit.default_timer()
@@ -93,6 +108,34 @@ if __name__ == "__main__":
     btlm = btlm.to("mps")
     input_data = torch.randint(vocab_size, (batch_size, context_length)).to("mps")
 
-    print("Running benchmarks...\n")
-    benchmark_forward(model=btlm, input_data=input_data, num_steps=10, num_warmup_steps=5)
-    benchmark_forward_backward(model=btlm, input_data=input_data, num_steps=10, num_warmup_steps=5)
+    print("Running FP32 benchmarks...\n")
+    benchmark_forward(
+        model=btlm,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=False,
+    )
+    benchmark_forward_backward(
+        model=btlm,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=False,
+    )
+
+    print("Running BF16 Mixed Precision benchmarks...\n")
+    benchmark_forward(
+        model=btlm,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=True,
+    )
+    benchmark_forward_backward(
+        model=btlm,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=True,
+    )
