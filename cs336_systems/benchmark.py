@@ -139,3 +139,22 @@ if __name__ == "__main__":
         num_warmup_steps=5,
         use_mixed_precision=True,
     )
+
+    print("Compiling model (this may take a moment)...")
+    compiled_model = torch.compile(btlm)
+
+    print("Running Compiled FP32 benchmarks...\n")
+    benchmark_forward(
+        model=compiled_model,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=False,
+    )
+    benchmark_forward_backward(
+        model=compiled_model,
+        input_data=input_data,
+        num_steps=10,
+        num_warmup_steps=5,
+        use_mixed_precision=False,
+    )
