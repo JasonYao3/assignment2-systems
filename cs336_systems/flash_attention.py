@@ -110,4 +110,61 @@ class FlashAttention2(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError("Backward pass not implemented yet")
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        d = Q.shape[-1]
+
+        # Determine the shape so we can safely broadcast the output
+        seq_len_q = Q.shape[-2]
+        seq_len_k = K.shape[-2]
+
+        # We need to compute D = rowsum(dO * O)
+        # grad_out is dO. They both have shape (*batch, seq_len, d)
+        # We elementwise multiply them, then sum along the d dimension
+        D_vec = (grad_out * O).sum(dim=-1, keepdim=True)
+
+        # We can implement the backward pass as a separate standard function, then compile it
+        # Since it takes python tensors, compiling it is fine
+        def raw_backward(q, k, v, do, l_vec, d_vec, causal):
+            # Equation 13: S = Q @ K.T / sqrt(d)
+            s = (q @ k.transpose(-2, -1)) / math.sqrt(d)
+
+            # Equation 14: P = exp(S - L)
+            # l_vec needs an extra dimension at the end to broadcast with S
+            p = torch.exp(s - l_vec.unsqueeze(-1))
+
+            if causal:
+                # Mask out causal elements in P by setting them to 0 rather than negative infinity
+                # (since 0 * any gradient = 0)
+                q_idx = torch.arange(seq_len_q, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(seq_len_k, device=q.device).unsqueeze(0)
+                mask = q_idx < k_idx
+                p = torch.where(mask, 0.0, p)
+
+            # Equation 15: dV = P.T @ dO
+            dv = p.transpose(-2, -1) @ do
+
+            # Equation 16: dP = dO @ V.T
+            dp = do @ v.transpose(-2, -1)
+
+            # Equation 17: dS = P * (dP - D)
+            ds = p * (dp - d_vec)
+
+            # Equation 18: dQ = dS @ K / sqrt(d)
+            dq = (ds @ k) / math.sqrt(d)
+
+            # Equation 19: dK = dS.T @ Q / sqrt(d)
+            dk = (ds.transpose(-2, -1) @ q) / math.sqrt(d)
+
+            return dq, dk, dv
+
+        # The instructions recommend using torch.compile to optimize this naive execution
+        compiled_backward = torch.compile(raw_backward)
+
+        # NOTE: Using torch.compile inside an autograd.Function backward pass on Mac MPS
+        # may cause a silent freeze/crash during testing (as observed in earlier tasks).
+        # While it is the correct implementation as requested, it might need to run on a Linux GPU.
+        dQ, dK, dV = compiled_backward(Q, K, V, grad_out, L, D_vec, is_causal)
+
+        # Return gradients in the exact same order as the forward inputs: Q, K, V, is_causal
+        return dQ, dK, dV, None
